@@ -61,6 +61,8 @@
   }
 
   function status(text, bad) {
+    const dm = document.querySelector('#am-modal .am-dialog-msg');
+    if (dm) { dm.textContent = text; dm.classList.toggle('bad', !!bad); }
     const el = root && root.querySelector('#am-status');
     if (!el) return;
     el.textContent = text;
@@ -183,21 +185,22 @@
 
   // ---------- 弹窗 ----------
   function showModal(title, html, done, label) {
-    document.querySelector('#am-modal')?.remove();
+    const host = document.querySelector('#am-dialog') || document.body;
+    host.querySelectorAll('#am-modal').forEach(n => n.remove());
     const m = document.createElement('div');
     m.id = 'am-modal';
     m.className = 'am-modal-bg';
     m.innerHTML =
       `<section class="am-modal"><header>${esc(title)}<button type="button" class="am-x">×</button></header>` +
-      `<div class="am-modal-content">${html}</div>` +
+      `<div class="am-modal-content">${html}</div><div class="am-dialog-msg"></div>` +
       `<footer><button type="button" class="am-btn am-light am-cancel">取消</button>` +
       `<button type="button" class="am-btn am-primary am-ok">${esc(label || '确定')}</button></footer></section>`;
-    document.body.appendChild(m);
+    host.appendChild(m);
     const close = () => m.remove();
     m.querySelector('.am-x').onclick = close;
     m.querySelector('.am-cancel').onclick = close;
-    m.onclick = e => { if (e.target === m) close(); };
     m.querySelector('.am-ok').onclick = () => { if (done(m) !== false) close(); };
+    try { m.scrollIntoView({ block: 'start' }); } catch (e) { /* ignore */ }
     const first = m.querySelector('input,textarea');
     if (first) first.focus();
   }
@@ -372,7 +375,7 @@
     panel.innerHTML =
       `<div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>API 配置管理器</b>` +
       `<div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div>` +
-      `<div class="inline-drawer-content"><div id="am-manager-root"></div></div></div>`;
+      `<div class="inline-drawer-content"><div id="am-dialog"></div><div id="am-manager-root"></div></div></div>`;
     root = panel.querySelector('#am-manager-root');
     render();
     return panel;
