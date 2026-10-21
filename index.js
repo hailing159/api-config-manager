@@ -155,6 +155,74 @@
     return ok;
   }
 
+  // ---------- 拉取模型列表 ----------
+  function fetchT(url, opt, ms) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), ms || 20000);
+    return fetch(url, Object.assign({}, opt, { signal: ctrl.signal }))
+      .catch(e => { throw new Error(e && e.name === 'AbortError' ? '请求超时' : (e && e.message) || '网络错误'); })
+      .finally(() => clearTimeout(t));
+  }
+
+  function stHeaders() {
+    try {
+      const c = window.SillyTavern && window.SillyTavern.getContext && window.SillyTavern.getContext();
+      if (c && c.getRequestHeaders) return c.getRequestHeaders();
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+
+  function extractModels(data) {
+    const arr = Array.isArray(data) ? data
+      : data && Array.isArray(data.data) ? data.data
+      : data && Array.isArray(data.models) ? data.models
+      : [];
+    const out = [];
+    arr.forEach(x => {
+      let id = typeof x === 'string' ? x : x && (x.id || x.name || x.model);
+      if (!id) return;
+      id = String(id).replace(/^models\//, '').trim();
+      if (id && !out.includes(id)) out.push(id);
+    });
+    return out;
+  }
+
+  // 先走酒馆后端（没有跨域问题），失败再尝试浏览器直连
+  async function fetchModels(rawUrl, key) {
+    const url = urlForImport(rawUrl);
+    if (!/^https?:\/\/\S+$/i.test(url)) throw new Error('请先填写有效的代理地址');
+    const errs = [];
+    const h = stHeaders();
+    if (h) {
+      try {
+        const r = await fetchT('/api/backends/chat-completions/status', {
+          method: 'POST',
+          headers: h,
+          body: JSON.stringify({ chat_completion_source: 'openai', reverse_proxy: url, proxy_password: key || '' }),
+        }, 25000);
+        if (r.ok) {
+          const data = await r.json();
+          if (!data || data.error) errs.push('站点没有返回模型列表（地址或 Key 可能不对）');
+          else {
+            const list = extractModels(data);
+            if (list.length) return list;
+            errs.push('站点返回的模型列表是空的');
+          }
+        } else errs.push('酒馆后端返回 ' + r.status);
+      } catch (e) { errs.push(e.message); }
+    }
+    try {
+      const r = await fetchT(url + '/models', { headers: key ? { Authorization: 'Bearer ' + key } : {} }, 20000);
+      if (!r.ok) throw new Error('站点返回 ' + r.status);
+      const list = extractModels(await r.json());
+      if (list.length) return list;
+      errs.push('直连返回的模型列表是空的');
+    } catch (e) {
+      errs.push(/failed to fetch|networkerror|load failed/i.test(e.message) ? '浏览器直连被拦截（跨域）' : e.message);
+    }
+    throw new Error(errs.join('；'));
+  }
+
   // ---------- 应用到酒馆 API 连接（Chat Completion → 自定义） ----------
   function applyConfig(c) {
     const $ = $$();
@@ -184,9 +252,10 @@
   }
 
   // ---------- 弹窗 ----------
+  let dlgAnchor = null;
+
   function showModal(title, html, done, label) {
-    const host = document.querySelector('#am-dialog') || document.body;
-    host.querySelectorAll('#am-modal').forEach(n => n.remove());
+    root.querySelectorAll('#am-modal').forEach(n => n.remove());
     const m = document.createElement('div');
     m.id = 'am-modal';
     m.className = 'am-modal-bg';
@@ -195,40 +264,76 @@
       `<div class="am-modal-content">${html}</div><div class="am-dialog-msg"></div>` +
       `<footer><button type="button" class="am-btn am-light am-cancel">取消</button>` +
       `<button type="button" class="am-btn am-primary am-ok">${esc(label || '确定')}</button></footer></section>`;
-    host.appendChild(m);
+    // 插在被点击的那张卡片后面；没有卡片就插在列表上方
+    const card = dlgAnchor && dlgAnchor.closest ? dlgAnchor.closest('.am-card') : null;
+    const list = root.querySelector('.am-list');
+    dlgAnchor = null;
+    if (card) card.insertAdjacentElement('afterend', m);
+    else if (list) list.insertAdjacentElement('beforebegin', m);
+    else root.appendChild(m);
     const close = () => m.remove();
     m.querySelector('.am-x').onclick = close;
     m.querySelector('.am-cancel').onclick = close;
-    m.querySelector('.am-ok').onclick = () => { if (done(m) !== false) close(); };
-    try { m.scrollIntoView({ block: 'start' }); } catch (e) { /* ignore */ }
-    const first = m.querySelector('input,textarea');
-    if (first) first.focus();
+    const okBtn = m.querySelector('.am-ok');
+    okBtn.onclick = () => {
+      let r;
+      try { r = done(m); } catch (e) { status('出错：' + e.message, true); return; }
+      if (r && typeof r.then === 'function') {
+        okBtn.disabled = true;
+        r.then(v => { if (v !== false) close(); else okBtn.disabled = false; })
+          .catch(e => { okBtn.disabled = false; status('出错：' + e.message, true); });
+      } else if (r !== false) close();
+    };
+    try { m.scrollIntoView({ block: 'nearest' }); } catch (e) { /* ignore */ }
   }
 
   function editModal(c) {
     const isNew = !c;
     const cfg = c || normalizeConfig({ name: '新配置', proxyUrl: '' });
+    let models = cfg.models.slice();
+    let fetchedFor = models.length ? cfg.proxyUrl + '|' + cfg.apiKey : '';
+    let allowEmpty = false;
+
     showModal(
       isNew ? '新建配置' : '编辑配置',
       `<label>名称</label><input id="am-f-name" class="am-input" value="${esc(cfg.name)}">` +
       `<label>代理地址（会自动补 /v1）</label><input id="am-f-url" class="am-input" value="${esc(cfg.proxyUrl)}" placeholder="https://example.com">` +
       `<label>API Key</label><input id="am-f-key" class="am-input" value="${esc(cfg.apiKey)}">` +
-      `<label>当前模型</label><input id="am-f-model" class="am-input" value="${esc(cfg.model)}">` +
-      `<label>模型列表（每行一个）</label><textarea id="am-f-models" class="am-textarea">${esc(cfg.models.join('\n'))}</textarea>`,
-      m => {
+      `<button type="button" class="am-btn am-light" id="am-f-fetch">获取模型列表</button>` +
+      `<div id="am-f-fetchmsg" class="am-hint">${models.length ? `已有 ${models.length} 个模型` : '填好地址和 Key 后点「获取模型列表」'}</div>` +
+      `<label>筛选模型</label><input id="am-f-filter" class="am-input" placeholder="输入关键字筛选…">` +
+      `<label>当前使用的模型</label><select id="am-f-model" class="am-input"></select>`,
+      async m => {
         const name = m.querySelector('#am-f-name').value.trim();
         const url = urlForImport(m.querySelector('#am-f-url').value);
+        const key = m.querySelector('#am-f-key').value.trim();
         if (!name) { status('名称不能为空', true); return false; }
         if (!/^https?:\/\/\S+$/i.test(url)) { status('请输入有效的 http/https 地址', true); return false; }
-        const models = m.querySelector('#am-f-models').value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+
+        // 没拉过、或地址/Key 改过：保存前自动拉一次
+        if (!models.length || url + '|' + key !== fetchedFor) {
+          try {
+            models = await fetchModels(url, key);
+            fetchedFor = url + '|' + key;
+            fillSelect(m);
+          } catch (e) {
+            if (!allowEmpty) {
+              allowEmpty = true;
+              status('获取模型失败：' + e.message + '。再点一次「保存」将不带模型列表保存', true);
+              return false;
+            }
+            if (url + '|' + key !== fetchedFor) models = [];
+          }
+        }
+        const sel = m.querySelector('#am-f-model').value;
         const next = normalizeConfig({
           id: cfg.id,
           name,
           type: cfg.type,
-          model: m.querySelector('#am-f-model').value.trim() || models[0] || '',
+          model: sel || models[0] || '',
           models,
           proxyUrl: url,
-          apiKey: m.querySelector('#am-f-key').value.trim(),
+          apiKey: key,
         });
         if (isNew) configs.push(next);
         else configs[configs.findIndex(x => x.id === cfg.id)] = next;
@@ -238,6 +343,42 @@
       },
       '保存'
     );
+
+    const m = root.querySelector('#am-modal');
+
+    function fillSelect(mm) {
+      const sel = mm.querySelector('#am-f-model');
+      const q = mm.querySelector('#am-f-filter').value.trim().toLowerCase();
+      const keep = sel.value || cfg.model;
+      const shown = models.filter(x => !q || x.toLowerCase().includes(q));
+      if (keep && !shown.includes(keep) && models.includes(keep)) shown.unshift(keep);
+      sel.innerHTML = shown.length
+        ? shown.map(x => `<option value="${esc(x)}">${esc(x)}</option>`).join('')
+        : `<option value="">${models.length ? '（没有匹配的模型）' : '（请先获取模型）'}</option>`;
+      if (keep && shown.includes(keep)) sel.value = keep;
+    }
+    fillSelect(m);
+    m.querySelector('#am-f-filter').oninput = () => fillSelect(m);
+
+    const fetchBtn = m.querySelector('#am-f-fetch');
+    const msg = m.querySelector('#am-f-fetchmsg');
+    fetchBtn.onclick = async () => {
+      fetchBtn.disabled = true;
+      msg.classList.remove('bad');
+      msg.textContent = '正在获取…';
+      try {
+        const url = urlForImport(m.querySelector('#am-f-url').value);
+        const key = m.querySelector('#am-f-key').value.trim();
+        models = await fetchModels(url, key);
+        fetchedFor = url + '|' + key;
+        allowEmpty = false;
+        fillSelect(m);
+        msg.textContent = `已获取 ${models.length} 个模型`;
+      } catch (e) {
+        msg.classList.add('bad');
+        msg.textContent = '获取失败：' + e.message;
+      } finally { fetchBtn.disabled = false; }
+    };
   }
 
   function pasteModal() {
@@ -303,7 +444,7 @@
       (configs.length && !list.length ? '<div class="am-empty">没有匹配的配置</div>' : '') +
       `</div><div id="am-status"></div></div>`;
 
-    root.querySelectorAll('[data-a]').forEach(b => { b.onclick = () => action(b.dataset.a, b.dataset.id); });
+    root.querySelectorAll('[data-a]').forEach(b => { b.onclick = () => action(b.dataset.a, b.dataset.id, b); });
     root.querySelectorAll('[data-sel]').forEach(cb => {
       cb.onchange = () => {
         if (cb.checked) selected.add(cb.dataset.sel); else selected.delete(cb.dataset.sel);
@@ -331,7 +472,8 @@
     };
   }
 
-  function action(a, id) {
+  function action(a, id, btn) {
+    dlgAnchor = btn || null;
     const c = configs.find(x => x.id === id);
     if (a === 'new') editModal(null);
     else if (a === 'edit' && c) editModal(c);
@@ -375,7 +517,7 @@
     panel.innerHTML =
       `<div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>API 配置管理器</b>` +
       `<div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div>` +
-      `<div class="inline-drawer-content"><div id="am-dialog"></div><div id="am-manager-root"></div></div></div>`;
+      `<div class="inline-drawer-content"><div id="am-manager-root"></div></div></div>`;
     root = panel.querySelector('#am-manager-root');
     render();
     return panel;
