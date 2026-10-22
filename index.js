@@ -297,7 +297,7 @@
     showModal(
       isNew ? '新建配置' : '编辑配置',
       `<label>名称</label><input id="am-f-name" class="am-input" value="${esc(cfg.name)}">` +
-      `<label>代理地址（会自动补 /v1）</label><input id="am-f-url" class="am-input" value="${esc(cfg.proxyUrl)}" placeholder="https://example.com">` +
+      `<label>代理地址（已带 /v1 就原样使用，没带会自动补）</label><input id="am-f-url" class="am-input" value="${esc(cfg.proxyUrl)}" placeholder="https://example.com">` +
       `<label>API Key</label><input id="am-f-key" class="am-input" value="${esc(cfg.apiKey)}">` +
       `<button type="button" class="am-btn am-light" id="am-f-fetch">获取模型列表</button>` +
       `<div id="am-f-fetchmsg" class="am-hint">${models.length ? `已有 ${models.length} 个模型` : '填好地址和 Key 后点「获取模型列表」'}</div>` +
